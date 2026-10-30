@@ -1,0 +1,5 @@
+node_mnodules
+dist
+.data
+playwright-report
+test-results
