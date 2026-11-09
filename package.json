@@ -12,6 +12,7 @@
     "start": "node dist/server.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node scripts/test-unit.mjs",
+    "test:db": "tsx --test --test-concurrency=1 tests/db/database.test.ts",
     "test:auth": "node --experimental-strip-types --test tests/auth/session.test.mjs",
     "test:api": "tsx --test --test-concurrency=1 tests/api/application.test.ts",
     "test:e2e": "playwright test",
