@@ -1,4 +1,4 @@
-node_mnodules
+node_modules
 dist
 .data
 playwright-report

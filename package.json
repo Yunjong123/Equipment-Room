@@ -21,7 +21,7 @@
     "cleanup": "tsx scripts/cleanup.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "check": "npm run typecheck && npm test && npm run test:auth && npm run test:api && npm run build",
+    "check": "npm run typecheck && npm test && npm run test:db && npm run test:auth && npm run test:api && npm run build",
     "account:create": "tsx scripts/create-account.ts",
     "db:migrate:prod": "node dist/migrate.mjs",
     "account:create:prod": "node dist/create-account.mjs",
