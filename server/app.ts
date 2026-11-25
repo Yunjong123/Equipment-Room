@@ -31,6 +31,7 @@ import {
   uuid
 } from '../shared/validation.ts';
 import { createEquipment, equipmentDetails, listEquipment, updateEquipment } from './services/equipment.ts';
+import { bookingDetails, changeBooking, listBookings, reserve } from './services/bookings.ts';
 const page = z.coerce.number().int().min(1).max(10000).default(1);
 const bookingFilters = z.object({
   page,
@@ -171,6 +172,47 @@ export function createApp(db: Database, config: Config, options: { now?: () => D
       today(),
       equipmentUpdateInput.parse(req.body)
     ))
+  );
+
+  app.get(
+    '/api/bookings',
+    async (req, res) => {
+      const input = bookingFilters.parse(req.query);
+      res.json(await listBookings(db, req.user!, today(), { ...input, overdue: input.overdue === 'true' }));
+    }
+  );
+  app.get(
+    '/api/staff/bookings',
+    requireStaff,
+    async (req, res) => {
+      const input = bookingFilters.parse(req.query);
+      res.json(await listBookings(db, req.user!, today(), { ...input, overdue: input.overdue === 'true', staff: true }));
+    }
+  );
+  app.get(
+    '/api/bookings/:id',
+    async (req, res) => res.json(await bookingDetails(db, req.user!, today(), uuid.parse(req.params.id)))
+  );
+  app.post(
+    '/api/bookings',
+    async (req, res) => {
+      const result = await reserve(db, req.user!, today(), reservationInput.parse(req.body));
+      res.status(result.repeated ? 200 : 201).json(result);
+    }
+  );
+  app.post(
+    '/api/bookings/:id/:action',
+    async (req, res) => {
+      const action = z.enum(['cancel', 'checkout', 'return', 'no-show']).parse(req.params.action);
+      res.json(await changeBooking(
+        db,
+        req.user!,
+        today(),
+        uuid.parse(req.params.id),
+        action,
+        actionInput.parse(req.body)
+      ));
+    }
   );
   app.get(
     '/api/staff/summary',

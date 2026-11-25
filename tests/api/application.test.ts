@@ -199,10 +199,273 @@ test(
   }
 );
 test(
+  'invalid dates and excessive date ranges are rejected',
+  async () => {
+    const item = await equipment();
+    await post(
+      member,
+      '/bookings',
+      {
+        equipmentId: item.id,
+        startDate: '2026-02-30',
+        endDate: '2026-03-01',
+        purpose: 'Test',
+        requestId: randomUUID()
+      }
+    ).expect(422);
+    await post(
+      member,
+      '/bookings',
+      {
+        equipmentId: item.id,
+        startDate: '2026-03-08',
+        endDate: '2026-03-15',
+        purpose: 'Test',
+        requestId: randomUUID()
+      }
+    ).expect(422);
+  }
+);
+test(
+  'a reservation has a slot for every inclusive date',
+  async () => {
+    const item = await equipment();
+    const record = await booking(item.id, member, '2026-03-08', '2026-03-10');
+    const result = await db.query<{ day: string }>(
+      'SELECT day FROM booking_days WHERE booking_id=$1 ORDER BY day',
+      [record.id]
+    );
+    assert.deepEqual(result.rows.map((row) => row.day), ['2026-03-08', '2026-03-09', '2026-03-10']);
+  }
+);
+test(
+  'overlapping reservations are rejected',
+  async () => {
+    const item = await equipment();
+    await booking(item.id, member, '2026-03-08', '2026-03-10');
+    await post(
+      other,
+      '/bookings',
+      {
+        equipmentId: item.id,
+        startDate: '2026-03-10',
+        endDate: '2026-03-11',
+        purpose: 'Overlap',
+        requestId: randomUUID()
+      }
+    ).expect(409);
+  }
+);
+test(
+  'two simultaneous requests for the same item and day produce one booking',
+  async () => {
+    const item = await equipment();
+    const body = { equipmentId: item.id, startDate: '2026-03-08', endDate: '2026-03-08', purpose: 'Race' };
+    const results = await Promise.all([
+      post(member, '/bookings', { ...body, requestId: randomUUID() }),
+      post(other, '/bookings', { ...body, requestId: randomUUID() })
+    ]);
+    assert.deepEqual(results.map((result) => result.status).sort(), [201, 409]);
+    const count = await db.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM bookings WHERE equipment_id=$1',
+      [item.id]
+    );
+    assert.equal(count.rows[0].count, 1);
+  }
+);
+test(
+  'replaying a successful reservation returns the original booking',
+  async () => {
+    const item = await equipment();
+    const record = await booking(item.id);
+    const replay = await post(member, '/bookings', record.body).expect(200);
+    assert.equal(replay.body.id, record.id);
+  }
+);
+test(
+  'concurrent identical requests return one reservation',
+  async () => {
+    const item = await equipment();
+    const body = {
+      equipmentId: item.id,
+      startDate: '2026-03-08',
+      endDate: '2026-03-08',
+      purpose: 'Same request',
+      requestId: randomUUID()
+    };
+    const results = await Promise.all([post(member, '/bookings', body), post(member, '/bookings', body)]);
+    assert.deepEqual(results.map((result) => result.status).sort(), [200, 201]);
+    assert.equal(results[0].body.id, results[1].body.id);
+  }
+);
+test(
+  'reused request IDs cannot change the reservation',
+  async () => {
+    const item = await equipment();
+    const record = await booking(item.id);
+    await post(member, '/bookings', { ...record.body, purpose: 'Changed' }).expect(409);
+  }
+);
+test(
+  'members cannot inspect or cancel another borrower reservation',
+  async () => {
+    const item = await equipment();
+    const record = await booking(item.id);
+    await other.agent.get(`/api/bookings/${record.id}`).expect(404);
+    await post(other, `/bookings/${record.id}/cancel`, { expectedVersion: 1, notes: '' }).expect(404);
+  }
+);
+test(
+  'cancellation releases reserved dates',
+  async () => {
+    const item = await equipment();
+    const record = await booking(item.id);
+    await post(member, `/bookings/${record.id}/cancel`, { expectedVersion: 1, notes: '' }).expect(200);
+    await booking(item.id, other);
+  }
+);
+test(
+  'stale actions fail without adding another audit event',
+  async () => {
+    const item = await equipment();
+    const record = await booking(item.id);
+    await checkout(record.id);
+    await post(staff, `/bookings/${record.id}/checkout`, { expectedVersion: 1, notes: '' }).expect(409);
+    const count = await db.query<{ count: number }>(
+      "SELECT count(*)::int AS count FROM audit_events WHERE booking_id=$1 AND action='booking_checked_out'",
+      [record.id]
+    );
+    assert.equal(count.rows[0].count, 1);
+  }
+);
+test(
+  'early return releases future dates but retains the return-day slot',
+  async () => {
+    const item = await equipment();
+    const record = await booking(item.id, member, '2026-03-08', '2026-03-10');
+    await checkout(record.id);
+    await post(
+      staff,
+      `/bookings/${record.id}/return`,
+      { expectedVersion: 2, notes: 'All parts present', returnCondition: 'ready' }
+    ).expect(200);
+    await post(
+      other,
+      '/bookings',
+      {
+        equipmentId: item.id,
+        startDate: '2026-03-08',
+        endDate: '2026-03-08',
+        purpose: 'Same day',
+        requestId: randomUUID()
+      }
+    ).expect(409);
+    await booking(item.id, other, '2026-03-09', '2026-03-10');
+  }
+);
+test(
+  'an overdue physical loan blocks an existing future reservation checkout',
+  async () => {
+    const item = await equipment();
+    const first = await booking(item.id);
+    const next = await booking(item.id, other, '2026-03-09');
+    await checkout(first.id);
+    now = new Date('2026-03-09T16:00:00Z');
+    const response = await post(staff, `/bookings/${next.id}/checkout`, { expectedVersion: 1, notes: '' }).expect(409);
+    assert.equal(response.body.error.code, 'STILL_OUT');
+    assert.equal((await detail(staff, first.id)).overdue, true);
+  }
+);
+test(
+  'members cannot confirm a physical return',
+  async () => {
+    const item = await equipment();
+    const record = await booking(item.id);
+    await checkout(record.id);
+    await post(member, `/bookings/${record.id}/return`, { expectedVersion: 2, notes: '', returnCondition: 'ready' }).expect(403);
+  }
+);
+test(
+  'maintenance returns require a reason and create a condition report',
+  async () => {
+    const item = await equipment();
+    const record = await booking(item.id);
+    await checkout(record.id);
+    await post(
+      staff,
+      `/bookings/${record.id}/return`,
+      { expectedVersion: 2, notes: '', returnCondition: 'maintenance' }
+    ).expect(422);
+    await post(
+      staff,
+      `/bookings/${record.id}/return`,
+      { expectedVersion: 2, notes: 'Loose lens mount', returnCondition: 'maintenance' }
+    ).expect(200);
+    const result = await staff.agent.get(`/api/equipment/${item.id}`);
+    assert.equal(result.body.equipment.condition, 'maintenance');
+    assert.equal(result.body.equipment.open_issues, 1);
+  }
+);
+test(
+  'maintenance keeps existing reservations visible but blocks new ones',
+  async () => {
+    const item = await equipment();
+    const record = await booking(item.id);
+    await patch(
+      staff,
+      `/equipment/${item.id}`,
+      { ...item.payload, condition: 'maintenance', conditionNotes: 'Inspection', expectedVersion: 1 }
+    ).expect(200);
+    assert.equal((await detail(staff, record.id)).blocked, true);
+    await post(
+      other,
+      '/bookings',
+      {
+        equipmentId: item.id,
+        startDate: '2026-03-09',
+        endDate: '2026-03-09',
+        purpose: 'Test',
+        requestId: randomUUID()
+      }
+    ).expect(409);
+  }
+);
+test(
   'equipment edits reject stale versions',
   async () => {
     const item = await equipment();
     await patch(staff, `/equipment/${item.id}`, { ...item.payload, name: 'Changed', expectedVersion: 1 }).expect(200);
     await patch(staff, `/equipment/${item.id}`, { ...item.payload, name: 'Old form', expectedVersion: 1 }).expect(409);
+  }
+);
+test(
+  'an expired session rejects the write until a fresh login supplies a new CSRF token',
+  async () => {
+    const borrower = await account('member');
+    const item = await equipment();
+    const input = {
+      equipmentId: item.id,
+      startDate: '2026-03-08',
+      endDate: '2026-03-08',
+      purpose: 'Preserved draft after expiry',
+      requestId: randomUUID()
+    };
+    await db.query("DELETE FROM sessions WHERE sess->>'userId'=$1", [borrower.user.id]);
+    const rejected = await post(borrower, '/bookings', input).expect(403);
+    assert.equal(rejected.body.error.code, 'CSRF_INVALID');
+    const beforeLogin = await db.query('SELECT id FROM bookings WHERE request_id=$1', [input.requestId]);
+    assert.equal(beforeLogin.rows.length, 0);
+
+    const refreshed = await borrower.agent.get('/api/auth/session').expect(200);
+    assert.equal(refreshed.body.user, null);
+    assert.notEqual(refreshed.body.csrfToken, borrower.token);
+    const login = await borrower.agent.post('/api/auth/login')
+      .set('X-CSRF-Token', refreshed.body.csrfToken)
+      .set('Origin', origin)
+      .send({ email: borrower.user.email, password }).expect(200);
+    borrower.token = login.body.csrfToken;
+    await post(borrower, '/bookings', input).expect(201);
+    const saved = await db.query('SELECT id FROM bookings WHERE request_id=$1', [input.requestId]);
+    assert.equal(saved.rows.length, 1);
   }
 );
