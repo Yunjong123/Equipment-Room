@@ -32,6 +32,9 @@ import {
 } from '../shared/validation.ts';
 import { createEquipment, equipmentDetails, listEquipment, updateEquipment } from './services/equipment.ts';
 import { bookingDetails, changeBooking, listBookings, reserve } from './services/bookings.ts';
+import { createIssue, listIssues, resolveIssue } from './services/issues.ts';
+import { authorizePhoto, removeCatalogPhoto, requirePhotoFile, uploadPhoto } from './services/photos.ts';
+
 const page = z.coerce.number().int().min(1).max(10000).default(1);
 const bookingFilters = z.object({
   page,
@@ -39,6 +42,7 @@ const bookingFilters = z.object({
   status: z.enum(['reserved', 'checked_out', 'returned', 'cancelled', 'no_show']).optional(),
   overdue: z.enum(['true', 'false']).optional(),
 }).strict();
+
 export function createApp(db: Database, config: Config, options: { now?: () => Date; testing?: boolean } = {}) {
   const app = express();
   const today = () => clubToday(config.timeZone, options.now?.() || new Date());
@@ -214,6 +218,68 @@ export function createApp(db: Database, config: Config, options: { now?: () => D
       ));
     }
   );
+
+  app.get(
+    '/api/issues',
+    async (req, res) => {
+      const input = z.object({ page, status: z.enum(['open', 'resolved']).optional(), equipmentId: uuid.optional() }).strict().parse(req.query);
+      res.json(await listIssues(db, req.user!, input));
+    }
+  );
+  app.post(
+    '/api/issues',
+    async (req, res) => res.status(201).json(await createIssue(db, req.user!, issueInput.parse(req.body)))
+  );
+  app.post(
+    '/api/issues/:id/resolve',
+    requireStaff,
+    async (req, res) => {
+      await resolveIssue(db, req.user!, uuid.parse(req.params.id), resolveInput.parse(req.body));
+      res.status(204).end();
+    }
+  );
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 2, parts: 3 }
+  });
+  app.post(
+    '/api/equipment/:id/photos',
+    limiter(30, 10 * 60 * 1000),
+    upload.single('file'),
+    async (req, res) => {
+      const input = z.object({ issueId: uuid.optional(), uploadId: uuid }).strict().parse(req.body);
+      res.status(201).json(await uploadPhoto(
+        db,
+        config.dataDir,
+        req.user!,
+        uuid.parse(req.params.id),
+        input.issueId,
+        req.file,
+        input.uploadId
+      ));
+    }
+  );
+  app.get(
+    '/api/photos/:id',
+    async (req, res) => {
+      const id = uuid.parse(req.params.id);
+      await authorizePhoto(db, req.user!, id);
+      const file = await requirePhotoFile(config.dataDir, id);
+      res.type('image/webp').set('Content-Disposition', 'inline').sendFile(
+        file,
+        { cacheControl: false, lastModified: false }
+      );
+    }
+  );
+  app.delete(
+    '/api/photos/:id',
+    requireStaff,
+    async (req, res) => {
+      await removeCatalogPhoto(db, config.dataDir, req.user!, uuid.parse(req.params.id));
+      res.status(204).end();
+    }
+  );
+
   app.get(
     '/api/staff/summary',
     requireStaff,

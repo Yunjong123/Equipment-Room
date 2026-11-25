@@ -1,7 +1,7 @@
 import test, { before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import supertest from 'supertest';
@@ -9,6 +9,8 @@ import sharp from 'sharp';
 import { openDatabase, migrate, type Database } from '../../server/db.ts';
 import { createApp } from '../../server/app.ts';
 import { hashPassword } from '../../server/passwords.ts';
+import { cleanupExpiredData } from '../../scripts/cleanup.ts';
+import { MAX_PHOTOS, MAX_UPLOAD_BYTES } from '../../shared/domain.ts';
 import type { Config } from '../../server/config.ts';
 import type { User } from '../../shared/types.ts';
 
@@ -100,7 +102,10 @@ beforeEach(() => {
 });
 after(async () => {
   if (db) await db.close();
-  if (directory) await rm(directory, { recursive: true, force: true });
+  sharp.cache(false);
+  if (directory) {
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
 });
 
 test(
@@ -438,6 +443,228 @@ test(
     await patch(staff, `/equipment/${item.id}`, { ...item.payload, name: 'Old form', expectedVersion: 1 }).expect(409);
   }
 );
+test(
+  'a borrowed-item report blocks new checkout until it is resolved',
+  async () => {
+    const item = await equipment();
+    const record = await booking(item.id);
+    const future = await booking(item.id, other, '2026-03-09');
+    await checkout(record.id);
+    await post(
+      staff,
+      `/bookings/${record.id}/return`,
+      { expectedVersion: 2, notes: '', returnCondition: 'ready' }
+    ).expect(200);
+    const report = await post(
+      member,
+      '/issues',
+      { equipmentId: item.id, bookingId: record.id, description: 'Loose latch', requestId: randomUUID() }
+    ).expect(201);
+    const before = await member.agent.get(`/api/equipment/${item.id}`);
+    assert.equal(before.body.equipment.open_issues, 1);
+    await post(
+      member,
+      '/bookings',
+      {
+        equipmentId: item.id,
+        startDate: '2026-03-10',
+        endDate: '2026-03-10',
+        purpose: 'Blocked by open report',
+        requestId: randomUUID()
+      }
+    ).expect(409);
+    now = new Date('2026-03-09T16:00:00Z');
+    await post(staff, `/bookings/${future.id}/checkout`, { expectedVersion: 1, notes: '' }).expect(409);
+    await post(other, `/issues/${report.body.id}/resolve`, { expectedVersion: 1, resolution: 'Fine' }).expect(403);
+    await post(
+      staff,
+      `/issues/${report.body.id}/resolve`,
+      { expectedVersion: 1, resolution: 'Inspected and tightened the latch.' }
+    ).expect(204);
+    const after = await member.agent.get(`/api/equipment/${item.id}`);
+    assert.equal(after.body.equipment.open_issues, 0);
+    await post(staff, `/bookings/${future.id}/checkout`, { expectedVersion: 1, notes: '' }).expect(200);
+  }
+);
+test(
+  'a member cannot report an item through another borrower loan',
+  async () => {
+    const item = await equipment();
+    const record = await booking(item.id);
+    await checkout(record.id);
+    await post(
+      other,
+      '/issues',
+      { equipmentId: item.id, bookingId: record.id, description: 'Wrong loan', requestId: randomUUID() }
+    ).expect(404);
+  }
+);
+test(
+  'a fake image is rejected by the decoder',
+  async () => {
+    const item = await equipment();
+    await staff.agent.post(`/api/equipment/${item.id}/photos`).set('X-CSRF-Token', staff.token)
+      .field(
+        'uploadId',
+        randomUUID()
+      ).attach(
+        'file',
+        Buffer.from('not an image'),
+        { filename: 'fake.jpg', contentType: 'image/jpeg' }
+      ).expect(415);
+  }
+);
+test(
+  'animated and oversized images are rejected',
+  async () => {
+    const item = await equipment();
+    const firstFrame = await sharp({ create: { width: 12, height: 12, channels: 4, background: '#ff0000' } }).png().toBuffer();
+    const secondFrame = await sharp({ create: { width: 12, height: 12, channels: 4, background: '#0000ff' } }).png().toBuffer();
+    const animated = await sharp([firstFrame, secondFrame], { join: { animated: true } })
+      .webp({ loop: 0, delay: [50, 50] })
+      .toBuffer();
+    await staff.agent.post(`/api/equipment/${item.id}/photos`).set('X-CSRF-Token', staff.token)
+      .field('uploadId', randomUUID())
+      .attach('file', animated, 'animated.webp')
+      .expect(415);
+    await staff.agent.post(`/api/equipment/${item.id}/photos`).set('X-CSRF-Token', staff.token)
+      .field('uploadId', randomUUID())
+      .attach('file', Buffer.alloc(MAX_UPLOAD_BYTES + 1), 'oversized.jpg')
+      .expect(413);
+  }
+);
+test(
+  'photos are rotated, bounded and stored as metadata-free WebP',
+  async () => {
+    const item = await equipment();
+    const source = await sharp({ create: { width: 2400, height: 1200, channels: 3, background: '#224466' } })
+      .withMetadata({ orientation: 6 })
+      .jpeg()
+      .toBuffer();
+    const response = await staff.agent.post(`/api/equipment/${item.id}/photos`).set('X-CSRF-Token', staff.token)
+      .field('uploadId', randomUUID())
+      .attach('file', source, 'oriented.jpg')
+      .expect(201);
+    const metadata = await sharp(path.join(directory, 'uploads', `${response.body.id}.webp`)).metadata();
+    assert.equal(metadata.format, 'webp');
+    assert.deepEqual([metadata.width, metadata.height], [900, 1800]);
+    assert.equal(metadata.orientation, undefined);
+    assert.equal(metadata.exif, undefined);
+  }
+);
+test(
+  'catalog uploads are private and retry-safe',
+  async () => {
+    const item = await equipment();
+    const image = await sharp({ create: { width: 12, height: 12, channels: 3, background: '#334455' } }).png().toBuffer();
+    const uploadId = randomUUID();
+    const send = () => staff.agent.post(`/api/equipment/${item.id}/photos`).set('X-CSRF-Token', staff.token).field(
+      'uploadId',
+      uploadId
+    ).attach(
+      'file',
+      image,
+      'photo.png'
+    );
+    const first = await send().expect(201);
+    const second = await send().expect(201);
+    assert.equal(first.body.id, second.body.id);
+    await member.agent.get(`/api/photos/${first.body.id}`).expect(200).expect('Content-Type', /image\/webp/);
+    await supertest(app).get(`/api/photos/${first.body.id}`).expect(401);
+    await member.agent.post(`/api/equipment/${item.id}/photos`).set('X-CSRF-Token', member.token)
+      .field('uploadId', randomUUID())
+      .attach('file', image, 'member-photo.png')
+      .expect(403);
+    await member.agent.delete(`/api/photos/${first.body.id}`).set('X-CSRF-Token', member.token).expect(403);
+    const count = await db.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM photos WHERE equipment_id=$1',
+      [item.id]
+    );
+    assert.equal(count.rows[0].count, 1);
+    await staff.agent.delete(`/api/photos/${first.body.id}`).set('X-CSRF-Token', staff.token).expect(204);
+  }
+);
+test(
+  'a rejected photo-limit write removes the newly created file',
+  async () => {
+    const item = await equipment();
+    const image = await sharp({ create: { width: 12, height: 12, channels: 3, background: '#556677' } }).png().toBuffer();
+    for (let index = 0; index < MAX_PHOTOS; index++) {
+      await staff.agent.post(`/api/equipment/${item.id}/photos`).set('X-CSRF-Token', staff.token)
+        .field('uploadId', randomUUID())
+        .attach('file', image, `photo-${index}.png`)
+        .expect(201);
+    }
+    const uploadDirectory = path.join(directory, 'uploads');
+    const before = (await readdir(uploadDirectory)).sort();
+    await staff.agent.post(`/api/equipment/${item.id}/photos`).set('X-CSRF-Token', staff.token)
+      .field('uploadId', randomUUID())
+      .attach('file', image, 'one-too-many.png')
+      .expect(409);
+    assert.deepEqual((await readdir(uploadDirectory)).sort(), before);
+  }
+);
+test(
+  'condition-report photos are not visible to another member',
+  async () => {
+    const item = await equipment();
+    const record = await booking(item.id);
+    await checkout(record.id);
+    const report = await post(
+      member,
+      '/issues',
+      { equipmentId: item.id, bookingId: record.id, description: 'Issue photo', requestId: randomUUID() }
+    ).expect(201);
+    const image = await sharp({ create: { width: 12, height: 12, channels: 3, background: '#445566' } }).png().toBuffer();
+    const photo = await member.agent.post(`/api/equipment/${item.id}/photos`).set('X-CSRF-Token', member.token)
+      .field(
+        'uploadId',
+        randomUUID()
+      ).field(
+        'issueId',
+        report.body.id
+      ).attach(
+        'file',
+        image,
+        'photo.png'
+      ).expect(201);
+    await other.agent.get(`/api/photos/${photo.body.id}`).expect(404);
+    await staff.agent.get(`/api/photos/${photo.body.id}`).expect(200);
+  }
+);
+test(
+  'cleanup removes old orphan uploads and keeps referenced files',
+  async () => {
+    const item = await equipment();
+    const uploadDirectory = path.join(directory, 'uploads');
+    await mkdir(uploadDirectory, { recursive: true });
+    const orphanId = randomUUID();
+    const referencedId = randomUUID();
+    const orphan = path.join(uploadDirectory, `${orphanId}.webp`);
+    const referenced = path.join(uploadDirectory, `${referencedId}.webp`);
+    await writeFile(orphan, 'orphan');
+    await writeFile(referenced, 'referenced');
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await utimes(orphan, old, old);
+    await utimes(referenced, old, old);
+    await db.query(
+      'INSERT INTO photos (id,equipment_id,uploaded_by,upload_request_id,source_hash) VALUES ($1,$2,$3,$4,$5)',
+      [referencedId, item.id, staff.user.id, randomUUID(), 'cleanup-test']
+    );
+
+    assert.equal(await cleanupExpiredData(db, directory), 1);
+    const remaining = await readdir(uploadDirectory);
+    assert.equal(remaining.includes(`${orphanId}.webp`), false);
+    assert.equal(remaining.includes(`${referencedId}.webp`), true);
+  }
+);
+test(
+  'missing API routes do not return the SPA document',
+  async () => {
+    await member.agent.get('/api/does-not-exist').expect(404).expect('Content-Type', /json/);
+  }
+);
+
 test(
   'an expired session rejects the write until a fresh login supplies a new CSRF token',
   async () => {
